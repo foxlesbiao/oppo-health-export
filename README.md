@@ -1,5 +1,7 @@
 # OPPO Health Export
 
+> **Doc 导航**：[English README](README_EN.md) · [AI Agent Guide](AGENT_GUIDE.md) · [MCP tool schemas](server/mcp-tools.json)
+
 通过 LSPosed hook 从 OPPO/欢太健康 App 导出加密健康数据，经标准 **MCP (Model Context Protocol)** 接口接入任意 AI agent 分析。
 
 > ⚠️ **仅供本人学习研究**。请勿用于侵犯他人隐私或商用。导出的是**你自己的**健康数据。

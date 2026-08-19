@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/foxlesbiao/oppo-health-export/server/mcp-tools.json",
+  "title": "oppo-health MCP tools",
+  "description": "Machine-readable contract for the oppo-health MCP server (server/mcp_server.py, stdio transport). Any MCP client can connect and call these tools.",
+  "server": "oppo-health",
+  "transport": "stdio",
+  "run": ["python", "server/mcp_server.py"],
+  "sink_db": "sink/health.db (SQLite, WAL; every column TEXT + __row_hash UNIQUE + __t int-ms)",
+  "tools": [
+    {
+      "name": "health_ingest",
+      "description": "Ingest incremental data as sectioned CSV ('===TABLE:<t>|TIMECOL:<col>===' + header + rows, multiple sections allowed). Idempotent by row hash; updates per-table watermark. Returns {tables, new_rows, dup_skipped, watermark}.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "sections_text": { "type": "string", "description": "Sectioned incremental CSV body" }
+        },
+        "required": ["sections_text"]
+      },
+      "returns": { "tables": "int", "new_rows": "int", "dup_skipped": "int", "watermark": "map<table,int ms>" }
+    },
+    {
+      "name": "health_watermark",
+      "description": "Read current per-table watermark (max synced timestamp in ms). Rediscovered when incremental syncing.",
+      "inputSchema": { "type": "object", "properties": {} },
+      "returns": { "table": "last_ts_ms" }
+    },
+    {
+      "name": "health_list_tables",
+      "description": "List all ingested tables with row counts.",
+      "inputSchema": { "type": "object", "properties": {} },
+      "returns": [{ "table": "string", "rows": "int" }]
+    },
+    {
+      "name": "health_stats",
+      "description": "Per-table overview: rows, min_t, max_t (ms).",
+      "inputSchema": { "type": "object", "properties": {} },
+      "returns": { "table": { "rows": "int", "min_t": "ms|nullable", "max_t": "ms|nullable" } }
+    },
+    {
+      "name": "health_query",
+      "description": "Query ingested rows of a table. columns defaults to '*' (all valid columns). since/until filter __t in ms. limit capped at 5000. Columns are validated against the table's real schema.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "table": { "type": "string", "description": "Existing table name" },
+          "columns": { "type": "string", "default": "*", "description": "Comma-separated valid columns (may include __t, __row_hash)" },
+          "since": { "type": "integer", "description": "ms timestamp, __t >= since" },
+          "until": { "type": "integer", "description": "ms timestamp, __t <= until" },
+          "limit": { "type": "integer", "default": 500, "maximum": 5000, "description": "Max rows returned" }
+        },
+        "required": ["table"]
+      },
+      "returns": { "columns": ["string"], "rows": [[ "string" ]] }
+    },
+    {
+      "name": "health_schema",
+      "description": "Show column structure of an existing table.",
+      "inputSchema": {
+        "type": "object",
+        "properties": { "table": { "type": "string", "description": "Existing table name" } },
+        "required": ["table"]
+      },
+      "returns": { "table": "string", "columns": ["string"] }
+    }
+  ],
+  "security": "All table/column identifiers are validated against ^[A-Za-z_][A-Za-z0-9_]*$ and, for queries, must exist on the target table. All values are bound parameters. This blocks SQL injection — preserve this contract in any modification.",
+  "data_format": {
+    "section": "===TABLE:<table>|TIMECOL:<time_col>===\n<header csv>\n<rows csv>",
+    "notes": "Header immediately follows the ====== line; trailing '===' must be stripped before parsing so TIMECOL is clean; rows comma-separated; time_col is millisecond epoch used for watermark."
+  }
+}
