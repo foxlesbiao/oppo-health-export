@@ -1,0 +1,17 @@
+# Android
+*.apk
+*.aab
+*.jar
+!app/libs/.gitkeep
+android/.gradle/
+android/build/
+android/app/build/
+android/.kotlin/
+android/local.properties
+android/.idea/
+
+# misc
+*.log
+.DS_Store
+__pycache__/
+*.pyc

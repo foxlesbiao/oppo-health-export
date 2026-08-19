@@ -1,0 +1,9 @@
+id=com.hermes.dbkeyhook
+name=OPPO Health DBKey Export
+version=500
+version_name=5.0.0
+author=foxlesbiao
+description=OPPO 健康数据库密钥提取 + 智能增量导出(流式分片/水位/幂等)上传至 Hermes
+minApiVersion=101
+targetApiVersion=102
+staticScope=true
