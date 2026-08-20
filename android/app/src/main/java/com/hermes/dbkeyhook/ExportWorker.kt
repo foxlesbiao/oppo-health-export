@@ -74,9 +74,12 @@ class ExportWorker(
         var chunkRows = 0L
         var uploadedChunks = 0
         var uploadedTables = 0L
+        // 批次标识: 一次「手动点导出」= 一个批次; 服务端据此只对最后一个分块触发一次分析
+        val batchId = System.currentTimeMillis().toString()
+        var chunkIndex = 0   // 当前(正在上传的)分块号, 1-based
         val initialTs = System.currentTimeMillis() - INITIAL_DAYS * 24 * 3600 * 1000
 
-        // 分块辅助(闭包)
+        // 分块辅助(闭包)。isFinal=true 表示这是本批次最后一个分块(所有表已处理完)
         fun ensureChunk(): BufferedWriter {
             if (chunkW == null) {
                 val f = File(ctx.cacheDir, "health_part_" + System.currentTimeMillis() + ".csv")
@@ -88,11 +91,13 @@ class ExportWorker(
             }
             return chunkW!!
         }
-        fun flushChunk(): Boolean {
+        fun flushChunk(isFinal: Boolean): Boolean {
             if (chunkW == null) return false
             try { chunkW!!.close() } catch (_: Throwable) {}
             val f = chunkFile!!
-            val ok = upload(f, urls, token, "incremental")
+            chunkIndex++
+            // final 块: total_chunks 在最后一块上传时才能确定 = 当前块号
+            val ok = upload(f, urls, token, "incremental", batchId, chunkIndex, isFinal, chunkIndex)
             try { f.delete() } catch (_: Throwable) {}
             if (ok) uploadedChunks++
             chunkW = null; chunkFile = null; chunkRows = 0L
@@ -119,12 +124,12 @@ class ExportWorker(
                         if (n > 0) { uploadedTables += n; lspLog("  $t: +$n (small)") }
                     }
                     chunkRows += n
-                    if (chunkRows >= CHUNK_ROWS) flushChunk()
+                    if (chunkRows >= CHUNK_ROWS) flushChunk(false)
                 } catch (e: Throwable) { lspLog("  $t fail: $e") }
             }
         } finally {
-            // 处理完所有表后, 上传剩余分块
-            try { flushChunk() } catch (_: Throwable) {}
+            // 处理完所有表后, 上传剩余分块 —— 这就是本批次最后一个分块
+            try { flushChunk(true) } catch (_: Throwable) {}
         }
 
         lspLog("done: ${uploadedTables} rows, ${uploadedChunks} chunks uploaded")
@@ -266,15 +271,17 @@ class ExportWorker(
         return rows
     }
 
-    private fun upload(f: File, urls: List<String>, token: String, mode: String): Boolean {
+    private fun upload(f: File, urls: List<String>, token: String, mode: String,
+                       batchId: String, chunkIndex: Int, isFinal: Boolean, totalChunks: Int): Boolean {
         for (u in urls) {
             if (u.isBlank()) continue
-            if (tryUpload(f, u, token, mode)) return true
+            if (tryUpload(f, u, token, mode, batchId, chunkIndex, isFinal, totalChunks)) return true
         }
         return false
     }
 
-    private fun tryUpload(f: File, url: String, token: String, mode: String): Boolean {
+    private fun tryUpload(f: File, url: String, token: String, mode: String,
+                          batchId: String, chunkIndex: Int, isFinal: Boolean, totalChunks: Int): Boolean {
         return try {
             val boundary = "----DBKeyHook" + System.currentTimeMillis()
             val conn = (URL(url).openConnection() as HttpURLConnection).apply {
@@ -284,7 +291,8 @@ class ExportWorker(
                 setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
                 if (token.isNotEmpty()) setRequestProperty("Authorization", "Bearer $token")
             }
-            val meta = "{\"source\":\"oppo-health\",\"mode\":\"$mode\"}"
+            val meta = "{\"source\":\"oppo-health\",\"mode\":\"$mode\",\"batch_id\":\"$batchId\"," +
+                    "\"chunk\":$chunkIndex,\"final\":${if (isFinal) 1 else 0},\"total_chunks\":$totalChunks}"
             val os = conn.outputStream
             os.write("--$boundary\r\nContent-Disposition: form-data; name=\"meta\"\r\n\r\n$meta\r\n".toByteArray(Charsets.UTF_8))
             os.write("--$boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"${f.name}\"\r\nContent-Type: text/csv\r\n\r\n".toByteArray(Charsets.UTF_8))
