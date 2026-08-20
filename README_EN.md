@@ -81,6 +81,7 @@ ssoid,device_type,data_created_timestamp,value,...
 
 ## Version
 
+- 5.1.0: chunked-batch dedup — upload meta carries batch_id/final/total_chunks; server triggers analysis only on the final chunk, eliminating repeated analyses from a single export.
 - 5.0.0: MCP-standardized server + version-aligned module; incremental watermark / stream batching / chunked upload / idempotent dedup.
 
 ## License

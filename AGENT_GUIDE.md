@@ -21,7 +21,7 @@ Both write the same sink DB, so data is consistent.
 
 ```
 android/                          # LSPosed hook module (Kotlin/Compose, libxposed)
-  app/build.gradle.kts            # versionCode 500 / versionName 5.0.0
+  app/build.gradle.kts            # versionCode 510 / versionName 5.1.0
   app/libs/                       # put libxposed-api.jar here (NOT committed, LGPL)
   app/src/main/
     java/com/hermes/dbkeyhook/

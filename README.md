@@ -81,6 +81,7 @@ ssoid,device_type,data_created_timestamp,value,...
 
 ## 版本
 
+- 5.1.0：分块批次去重 — 上传 meta 携带 batch_id/final/total_chunks，服务端仅对最后一个分块触发一次分析，杜绝一次导出多次重复分析。
 - 5.0.0：MCP 规范化服务端 + 模块版本对齐；增量水位/流式分片/分块上传/幂等去重。
 
 ## License
