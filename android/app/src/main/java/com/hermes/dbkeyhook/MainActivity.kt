@@ -1,5 +1,8 @@
 package com.hermes.dbkeyhook
 
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -15,6 +18,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import java.io.File
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -35,6 +39,21 @@ class MainActivity : ComponentActivity() {
                             .commit()
                         writeSharedConfig(range, url, urlExternal, token)
                         Toast.makeText(this, "配置已保存", Toast.LENGTH_SHORT).show()
+                    },
+                    onManualExport = {
+                        // 前台打开健康 App → onCreate hook 自动轮询 db_key 并导出
+                        try {
+                            val intent = packageManager.getLaunchIntentForPackage("com.heytap.health")
+                            if (intent != null) {
+                                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                startActivity(intent)
+                                Toast.makeText(this, "已打开健康 App，等待 key 就绪后自动导出…", Toast.LENGTH_LONG).show()
+                            } else {
+                                Toast.makeText(this, "未找到健康 App", Toast.LENGTH_SHORT).show()
+                            }
+                        } catch (t: Throwable) {
+                            Toast.makeText(this, "打开失败: ${t.message}", Toast.LENGTH_SHORT).show()
+                        }
                     }
                 )
             }
@@ -69,12 +88,14 @@ fun HealthConfigScreen(
     prefs: android.content.SharedPreferences,
     toast: (String) -> Unit,
     onSave: (Int, String, String, String) -> Unit,
+    onManualExport: () -> Unit,
 ) {
     var rangeIdx by remember { mutableStateOf(prefs.getInt("range", 1)) }
     var url by remember { mutableStateOf(prefs.getString("url", "") ?: "") }
     var urlExternal by remember { mutableStateOf(prefs.getString("url_external", "") ?: "") }
     var token by remember { mutableStateOf(prefs.getString("token", "") ?: "") }
     var status by remember { mutableStateOf("") }
+    var lastKey by remember { mutableStateOf(readLastKey()) }
 
     val ranges = listOf("最近7天", "最近30天", "最近90天", "全部")
 
@@ -100,6 +121,25 @@ fun HealthConfigScreen(
                 Text("54 张表全部处理：按天聚合 + 统计（avg/min/max）", color = Color(0xFFA5D6A7), fontSize = 12.sp)
                 Text("无需选择指标，直接导出全部", color = Color(0xFFA5D6A7), fontSize = 12.sp)
             }
+        }
+
+        HorizontalDivider(color = Color(0xFF2A3050))
+
+        // ── 手动导出 ──
+        Button(
+            onClick = {
+                status = "⏳ 正在打开健康 App，key 就绪后自动导出…"
+                onManualExport()
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("📤 立即导出", color = Color.White, fontWeight = FontWeight.Bold)
+        }
+
+        if (lastKey != null) {
+            Text("🔑 db_key: ${lastKey!!.take(12)}…（${lastKey!!.length} 字符）", color = Color(0xFF66BB6A), fontSize = 12.sp)
+        } else {
+            Text("🔑 db_key: 未获取（需先打开一次健康 App）", color = Color(0xFFEF5350), fontSize = 12.sp)
         }
 
         HorizontalDivider(color = Color(0xFF2A3050))
@@ -155,4 +195,11 @@ fun HealthConfigScreen(
             Text(status, color = Color(0xFF66BB6A), fontSize = 13.sp)
         }
     }
+}
+
+private fun readLastKey(): String? {
+    return try {
+        val f = File("/data/local/tmp/dbkey_result.txt")
+        if (f.exists()) f.readText().trim().ifEmpty { null } else null
+    } catch (_: Throwable) { null }
 }
