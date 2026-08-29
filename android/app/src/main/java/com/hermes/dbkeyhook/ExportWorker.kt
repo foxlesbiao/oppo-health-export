@@ -147,7 +147,7 @@ class ExportWorker(
         var wroteHeader = false
         while (true) {
             val where = if (cursorTs > 0) "\"$timeCol\" > $cursorTs" else null
-            val sql = "SELECT ${cols.joinToString(",")} FROM \"$table\"" +
+            val sql = "SELECT ${cols.joinToString(",") { "\"" + it.replace("\"", "\"\"") + "\"" }} FROM \"$table\"" +
                     (where?.let { " WHERE $it" } ?: "") + " ORDER BY \"$timeCol\" ASC LIMIT $BATCH"
             val batch = query(db, sql)
             if (batch.isEmpty()) break
@@ -170,7 +170,7 @@ class ExportWorker(
     }
 
     private fun streamSmallTable(db: Any, table: String, cols: List<String>, w: BufferedWriter): Int {
-        val sql = "SELECT ${cols.joinToString(",")} FROM \"$table\" LIMIT $SMALL_LIMIT"
+        val sql = "SELECT ${cols.joinToString(",") { "\"" + it.replace("\"", "\"\"") + "\"" }} FROM \"$table\" LIMIT $SMALL_LIMIT"
         val rows = query(db, sql)
         if (rows.isEmpty()) return 0
         w.write("===TABLE:$table|TIMECOL:===\n")

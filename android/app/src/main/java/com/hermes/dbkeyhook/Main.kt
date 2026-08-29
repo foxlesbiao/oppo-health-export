@@ -66,7 +66,7 @@ class Main : XposedModule() {
             log("setting up auto-export trigger...")
             hook(onCreate).intercept { chain ->
                 val result = chain.proceed()
-                val act = chain.thisObject
+                val act = chain.getThisObject()
                 if (act is android.app.Activity) {
                     val appCtx = act.applicationContext
                     log("Activity created, scheduling auto-export")
@@ -170,6 +170,6 @@ class Main : XposedModule() {
     }
 
     private fun log(msg: String) {
-        log(android.util.Log.INFO, "DBKeyHook", msg)
+        android.util.Log.i("DBKeyHook", msg)
     }
 }
