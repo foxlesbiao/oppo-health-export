@@ -60,7 +60,7 @@ class ExportWorker(
         if (url.isEmpty() && urlExternal.isEmpty()) { toast("⚠️ 未配置上传地址"); return false }
         val urls = listOfNotNull(url, urlExternal)
 
-        val cursor = fetchCursor(urls)
+        val cursor = fetchCursor(urls, token)
         lspLog("server watermark: ${cursor.size} tables")
 
         val sqliteCls = openSqLite() ?: run { toast("❌ SQLCipher 加载失败"); return false }
@@ -179,13 +179,14 @@ class ExportWorker(
         return rows.size
     }
 
-    private fun fetchCursor(urls: List<String>): Map<String, Long> {
+    private fun fetchCursor(urls: List<String>, token: String): Map<String, Long> {
         for (u in urls) {
             if (u.isBlank()) continue
             try {
                 val base = u.trimEnd('/')
                 val conn = (URL(base + "/api/cursor").openConnection() as HttpURLConnection).apply {
                     requestMethod = "GET"; connectTimeout = 6000; readTimeout = 10000
+                    if (token.isNotEmpty()) setRequestProperty("Authorization", "Bearer $token")
                 }
                 val code = conn.responseCode
                 if (code == 200) {

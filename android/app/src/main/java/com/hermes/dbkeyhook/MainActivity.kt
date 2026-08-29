@@ -69,8 +69,11 @@ class MainActivity : ComponentActivity() {
             "    <string name=\"token\">$token</string>\n" +
             "</map>\n"
         try {
+            // 防注入: 配置写入走 base64, 不拼接 shell 字符串
+            // (URL/token 可能含单引号/特殊字符, echo '$xml' 会破壳)
+            val b64 = android.util.Base64.encodeToString(xml.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
             val p = Runtime.getRuntime().exec(arrayOf("/system/bin/su", "-c",
-                "echo '$xml' > /data/local/tmp/dbkey_config.xml && chmod 644 /data/local/tmp/dbkey_config.xml"))
+                "echo '" + b64 + "' | base64 -d > /data/local/tmp/dbkey_config.xml && chmod 644 /data/local/tmp/dbkey_config.xml"))
             p.waitFor()
             if (p.exitValue() != 0) {
                 val err = p.errorStream.bufferedReader().readText()
