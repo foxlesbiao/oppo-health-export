@@ -3,6 +3,7 @@
 *.aab
 *.jar
 !app/libs/.gitkeep
+!app/libs/*.jar
 android/.gradle/
 android/build/
 android/app/build/

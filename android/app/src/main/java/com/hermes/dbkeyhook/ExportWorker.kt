@@ -60,7 +60,7 @@ class ExportWorker(
         if (url.isEmpty() && urlExternal.isEmpty()) { toast("⚠️ 未配置上传地址"); return false }
         val urls = listOfNotNull(url, urlExternal)
 
-        val cursor = fetchCursor(urls)
+        val cursor = fetchCursor(urls, token)
         lspLog("server watermark: ${cursor.size} tables")
 
         val sqliteCls = openSqLite() ?: run { toast("❌ SQLCipher 加载失败"); return false }
@@ -147,7 +147,7 @@ class ExportWorker(
         var wroteHeader = false
         while (true) {
             val where = if (cursorTs > 0) "\"$timeCol\" > $cursorTs" else null
-            val sql = "SELECT ${cols.joinToString(",")} FROM \"$table\"" +
+            val sql = "SELECT ${cols.joinToString(",") { "\"" + it.replace("\"", "\"\"") + "\"" }} FROM \"$table\"" +
                     (where?.let { " WHERE $it" } ?: "") + " ORDER BY \"$timeCol\" ASC LIMIT $BATCH"
             val batch = query(db, sql)
             if (batch.isEmpty()) break
@@ -170,7 +170,7 @@ class ExportWorker(
     }
 
     private fun streamSmallTable(db: Any, table: String, cols: List<String>, w: BufferedWriter): Int {
-        val sql = "SELECT ${cols.joinToString(",")} FROM \"$table\" LIMIT $SMALL_LIMIT"
+        val sql = "SELECT ${cols.joinToString(",") { "\"" + it.replace("\"", "\"\"") + "\"" }} FROM \"$table\" LIMIT $SMALL_LIMIT"
         val rows = query(db, sql)
         if (rows.isEmpty()) return 0
         w.write("===TABLE:$table|TIMECOL:===\n")
@@ -179,13 +179,14 @@ class ExportWorker(
         return rows.size
     }
 
-    private fun fetchCursor(urls: List<String>): Map<String, Long> {
+    private fun fetchCursor(urls: List<String>, token: String): Map<String, Long> {
         for (u in urls) {
             if (u.isBlank()) continue
             try {
                 val base = u.trimEnd('/')
                 val conn = (URL(base + "/api/cursor").openConnection() as HttpURLConnection).apply {
                     requestMethod = "GET"; connectTimeout = 6000; readTimeout = 10000
+                    if (token.isNotEmpty()) setRequestProperty("Authorization", "Bearer $token")
                 }
                 val code = conn.responseCode
                 if (code == 200) {

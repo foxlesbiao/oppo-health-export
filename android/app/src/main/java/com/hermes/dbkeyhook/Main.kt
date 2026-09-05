@@ -21,6 +21,10 @@ class Main : XposedModule() {
     @Volatile
     private var cachedDbKey: String? = null
 
+    companion object {
+        @Volatile private var exportScheduled = false
+    }
+
     override fun onPackageLoaded(param: XposedModuleInterface.PackageLoadedParam) {
         log("package loaded: ${param.packageName}")
         if (param.packageName != "com.heytap.health") return
@@ -42,9 +46,11 @@ class Main : XposedModule() {
                     val alias = chain.getArg(0) as? String
                     if (result != null) {
                         val value = result.toString()
-                        log("DECRYPTED alias=$alias value=$value")
+                        // 日志脱敏: 只打印长度, 不打印 key 内容(logcat 可被任何有 adb 权限的进程读)
+                        log("DECRYPTED alias=$alias len=${value.length}")
                         if (alias != null) {
-                            appendToFile("/data/local/tmp/dbkey_all.txt", "$alias=$value")
+                            // 只记录 alias 和长度, 不落明文 key
+                            appendToFile("/data/local/tmp/dbkey_all.txt", "$alias(len=${value.length})")
                             // db_key 单独存（兼容旧逻辑，导出用）
                             if (alias == "db_key") {
                                 cachedDbKey = value
@@ -66,10 +72,12 @@ class Main : XposedModule() {
             log("setting up auto-export trigger...")
             hook(onCreate).intercept { chain ->
                 val result = chain.proceed()
-                val act = chain.thisObject
+                val act = chain.getThisObject()
                 if (act is android.app.Activity) {
+                    if (exportScheduled) return@intercept result
+                    exportScheduled = true
                     val appCtx = act.applicationContext
-                    log("Activity created, scheduling auto-export")
+                    log("Activity created, scheduling auto-export (once)")
                     Thread {
                         try {
                             // 轮询等待 db_key 就绪（最长 30s，每 2s 一次）
@@ -149,7 +157,10 @@ class Main : XposedModule() {
 
     private fun saveToFile(path: String, content: String) {
         try {
-            File(path).writeText(content)
+            val f = File(path)
+            f.writeText(content)
+            // 限制权限: 仅 owner 可读写 (防止其他应用/进程读走主密钥)
+            try { f.setReadable(false, false); f.setReadable(true, true); f.setWritable(false, false); f.setWritable(true, true) } catch (_: Throwable) {}
             log("saved to $path")
         } catch (e: Throwable) {
             log("save fail: $e")
@@ -170,6 +181,6 @@ class Main : XposedModule() {
     }
 
     private fun log(msg: String) {
-        log(android.util.Log.INFO, "DBKeyHook", msg)
+        android.util.Log.i("DBKeyHook", msg)
     }
 }
