@@ -13,8 +13,11 @@ import java.lang.reflect.Modifier
  *
  * 改为稳定锚点策略：
  *  1. hook AesGcmAndroidKeyStore 解密方法（b() 优先，缺失则自动发现 (String,String)->String 实例方法）
- *  2. Activity.onCreate 轮询等待 db_key（hook 缓存 / 文件），就绪后自动导出
- *  3. 不再虚拟调用 bj4.INSTANCE.a()
+ *  2. hook SQLCipher openDatabase(path, password, ...)：密码参数即 db_key，打开数据库必经，混淆免疫
+ *  3. Activity.onCreate 轮询等待 db_key（hook 缓存 / 文件），就绪后自动导出
+ *  4. 不再虚拟调用 bj4.INSTANCE.a()
+ * v5.2.2: 修复 UI 读不到 dbkey_result.txt（saveToFile 0600 属主是健康 App，UI UID 不同）；
+ *         新增 SQLCipher openDatabase 锚点（修复新版 App 启动不解密 db_key 导致真机拿不到 key）。
  */
 class Main : XposedModule() {
 
@@ -44,18 +47,15 @@ class Main : XposedModule() {
                 hook(m).intercept { chain ->
                     val result = chain.proceed()
                     val alias = chain.getArg(0) as? String
-                    if (result != null) {
-                        val value = result.toString()
+                    val value = result?.toString()
+                    if (value != null && alias != null) {
                         // 日志脱敏: 只打印长度, 不打印 key 内容(logcat 可被任何有 adb 权限的进程读)
                         log("DECRYPTED alias=$alias len=${value.length}")
-                        if (alias != null) {
-                            // 只记录 alias 和长度, 不落明文 key
-                            appendToFile("/data/local/tmp/dbkey_all.txt", "$alias(len=${value.length})")
-                            // db_key 单独存（兼容旧逻辑，导出用）
-                            if (alias == "db_key") {
-                                cachedDbKey = value
-                                saveToFile("/data/local/tmp/dbkey_result.txt", value)
-                            }
+                        appendToFile("/data/local/tmp/dbkey_all.txt", "$alias(len=${value.length})")
+                        // db_key 单独存（导出用）；chmod 644 让模块 UI 进程也能读
+                        if (alias == "db_key") {
+                            cachedDbKey = value
+                            saveAndShareKey(value)
                         }
                     }
                     result
@@ -65,7 +65,38 @@ class Main : XposedModule() {
             log("keystore hook setup fail: $t")
         }
 
-        // ── 2. Activity.onCreate → 自动导出（不再调用 bj4）──
+        // ── 2. 稳定锚点 #2：hook SQLCipher openDatabase，密码参数即 db_key ──
+        // 新版 App 启动未必立即解密 db_key（走 AesGcmAndroidKeyStore.b 的时机不定），
+        // 但只要打开数据库必然调用 openDatabase(path, password, ...)，混淆免疫。
+        try {
+            for (cn in listOf(
+                "net.zetetic.database.sqlcipher.SQLiteDatabase",
+                "net.sqlcipher.database.SQLiteDatabase",
+            )) {
+                val sqlCls = try { Class.forName(cn, false, cl) } catch (_: Throwable) { continue }
+                for (m in sqlCls.declaredMethods) {
+                    if (m.name != "openDatabase" && m.name != "openOrCreateDatabase") continue
+                    val ps = m.parameterTypes
+                    // openDatabase(path, password, ...)：前两个参数都是 String
+                    if (ps.size < 2 || ps[0] != String::class.java || ps[1] != String::class.java) continue
+                    m.isAccessible = true
+                    log("hooking $cn.${m.name}(path, password, ...)")
+                    hook(m).intercept { chain ->
+                        val pw = chain.getArg(1) as? String
+                        if (!pw.isNullOrEmpty() && pw != cachedDbKey) {
+                            cachedDbKey = pw
+                            saveAndShareKey(pw)
+                            log("DBKey captured from $cn.${m.name}(), length=${pw.length}")
+                        }
+                        chain.proceed()
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            log("sqlcipher hook setup fail: $t")
+        }
+
+        // ── 3. Activity.onCreate → 自动导出（不再调用 bj4）──
         try {
             val activityCls = Class.forName("android.app.Activity", false, cl)
             val onCreate = activityCls.getDeclaredMethod("onCreate", android.os.Bundle::class.java)
@@ -164,6 +195,25 @@ class Main : XposedModule() {
             log("saved to $path")
         } catch (e: Throwable) {
             log("save fail: $e")
+        }
+    }
+
+    /**
+     * db_key 落盘 + chmod 644。
+     * v5.2.1 bug: saveToFile 把权限收紧到 0600，文件属主是健康 App UID，
+     * 模块 UI（自己的 UID）读不到 → UI 永远显示"db_key 未获取"。
+     * /data/local/tmp 下该文件仅 root/adb 可列目录，644 泄露面可控。
+     */
+    private fun saveAndShareKey(key: String) {
+        try {
+            val f = File("/data/local/tmp/dbkey_result.txt")
+            f.writeText(key)
+            try {
+                Runtime.getRuntime().exec(arrayOf("chmod", "644", f.absolutePath)).waitFor()
+            } catch (_: Throwable) {}
+            log("db_key saved+shared (len=${key.length})")
+        } catch (e: Throwable) {
+            log("saveAndShareKey fail: $e")
         }
     }
 
