@@ -24,6 +24,11 @@ import java.lang.reflect.Modifier
  *   2. SQLCipher openDatabase hook 增加 ClassLoader.loadClass 延迟挂载（onPackageLoaded
  *      时 zetetic 类若未加载则 watch，首次加载即挂）+ 覆盖 char[]/byte[] 密码重载
  *   3. dbkey_result.txt 读取兜底 try/catch（同目录权限场景）
+ * v5.3 (2026-09-11 第二份 logcat, 6.7.19):
+ *   App 6.7.19 冷启动根本不解密 alias=db_key（主进程只解 unique_key=MMKV key），
+ *   且 DB 延迟打开；Activity.onCreate hook 在该机型上不触发。
+ *   → 导出触发改为 openDatabase 捕获密码后立即执行（ctx 取 ActivityThread.currentApplication()），
+ *     Activity.onCreate 保留为后备。App 版本名 6.7.19 确认。
  */
 class Main : XposedModule() {
 
@@ -107,6 +112,13 @@ class Main : XposedModule() {
                             cachedDbKey = pw
                             saveAndShareKey(pw)
                             log("DBKey captured from ${sqlCls.name}.${m.name}(), length=${pw.length}")
+                            // v5.3: DB 打开即触发导出（不依赖 Activity hook — 6.7.19 上该 hook 不触发）
+                            currentApp()?.let { app ->
+                                if (!exportScheduled) {
+                                    exportScheduled = true
+                                    triggerExport(app, cl, pw)
+                                }
+                            } ?: log("no app ctx yet for export")
                         }
                         chain.proceed()
                     }
@@ -268,6 +280,17 @@ class Main : XposedModule() {
 
     /** 模块进程内缓存 ctx（appendToFile 用）；XposedModule 无 Context，取 hook 到的 Activity 的 */
     private val savedCtx = java.util.concurrent.atomic.AtomicReference<android.content.Context?>(null)
+
+    /** 取目标 app 的 Application（v5.3：不依赖 Activity hook 也能拿 ctx） */
+    private fun currentApp(): android.content.Context? {
+        savedCtx.get()?.let { return it }
+        return try {
+            val at = Class.forName("android.app.ActivityThread")
+            val m = at.getDeclaredMethod("currentApplication")
+            m.isAccessible = true
+            m.invoke(null) as? android.content.Context
+        } catch (_: Throwable) { null }
+    }
 
     private fun appendToFile(path: String, line: String) {
         try {
