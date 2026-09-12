@@ -12,8 +12,8 @@ android {
         applicationId = "com.hermes.dbkeyhook"
         minSdk = 26
         targetSdk = 34
-        versionCode = 530
-        versionName = "5.3.0"
+        versionCode = 532
+        versionName = "5.3.2"
     }
 
     buildTypes {

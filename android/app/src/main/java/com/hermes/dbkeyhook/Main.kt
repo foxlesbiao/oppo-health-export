@@ -29,6 +29,13 @@ import java.lang.reflect.Modifier
  *   且 DB 延迟打开；Activity.onCreate hook 在该机型上不触发。
  *   → 导出触发改为 openDatabase 捕获密码后立即执行（ctx 取 ActivityThread.currentApplication()），
  *     Activity.onCreate 保留为后备。App 版本名 6.7.19 确认。
+ * v5.3.1 (2026-09-11 第三份 logcat + 多模型分析):
+ *   6.7.19 主进程冷启动不碰 db_key/主库（纯 UI 20s 无任何密码事件）→ 等 DB 打开不可行。
+ *   1. Application.onCreate watchdog（120s 轮询）：cachedDbKey/落盘文件有 key 即单飞导出，失败 60s 重试
+ *   2. openDatabase hook 每次调用打日志（path+pwLen），诊断不再靠猜
+ *   3. 心跳日志：注入后 60s 每 5s 一条，直接确认 hook 存活
+ *   4. Activity hook 降级为仅记日志（触发职责移交 watchdog）
+ *   密钥链佐证：hw_key=38(32hex+6)、goal_key=40(32hex+8) → db_key=32hex+"db_key"(38)，恒定可落盘复用。
  */
 class Main : XposedModule() {
 
@@ -36,7 +43,7 @@ class Main : XposedModule() {
     private var cachedDbKey: String? = null
 
     companion object {
-        @Volatile private var exportScheduled = false
+        @Volatile private var exportScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
         @Volatile private var sqlWatchDone = java.util.concurrent.atomic.AtomicBoolean(false)
     }
 
@@ -45,6 +52,19 @@ class Main : XposedModule() {
         if (param.packageName != "com.heytap.health") return
         log("target app found, hooking...")
         val cl = param.defaultClassLoader
+
+        // ── 0. 心跳：进程启动后 60s 内每 5s 打一条，用于从 logcat 直接确认 hook 注入成功 ──
+        try {
+            log("injected pid=${android.os.Process.myPid()}, uid=${android.os.Process.myUid()}")
+            val hb = Thread {
+                for (i in 0 until 12) {
+                    try { Thread.sleep(5000) } catch (_: InterruptedException) { return@Thread }
+                    log("heartbeat#$i dbKey=${if (cachedDbKey != null) "captured" else "none"}")
+                }
+            }
+            hb.isDaemon = true
+            hb.start()
+        } catch (_: Throwable) {}
 
         // ── 1. 稳定锚点：hook AesGcmAndroidKeyStore 解密方法 ──
         try {
@@ -79,6 +99,29 @@ class Main : XposedModule() {
             log("keystore hook setup fail: $t")
         }
 
+        // ── 1.5 加密锚点：hook enCryptData(alias, plaintext, ssoid)。
+        // 6.7.19 App 升级后 hasKey("db_key")=false → initDbKey 走「new key」enCryptData 分支，
+        // deCryptData 永不执行 —— 这是 v5.3.x 真机抓不到 key 的根因（smali 反编译确认）。
+        try {
+            val encCls = Class.forName("com.heytap.health.base.encrypt.AesGcmAndroidKeyStore", false, cl)
+            val encM = encCls.getDeclaredMethod("enCryptData",
+                String::class.java, String::class.java, String::class.java)
+            encM.isAccessible = true
+            log("hooking enCryptData(alias, plain, ssoid)")
+            hook(encM).intercept { chain ->
+                val alias = chain.getArg(0) as? String
+                val plain = chain.getArg(1) as? String
+                if (alias == "db_key" && !plain.isNullOrEmpty() && plain != cachedDbKey) {
+                    cachedDbKey = plain
+                    saveAndShareKey(plain)
+                    log("DBKey captured from enCryptData, length=${plain.length}")
+                }
+                chain.proceed()
+            }
+        } catch (t: Throwable) {
+            log("encrypt hook fail: $t")
+        }
+
         // ── 2. 稳定锚点 #2：hook SQLCipher openDatabase，密码参数即 db_key ──
         // 新版 App 启动未必立即解密 db_key（走 AesGcmAndroidKeyStore.b 的时机不定），
         // 但只要打开数据库必然调用 openDatabase(path, password, ...)，混淆免疫。
@@ -108,15 +151,24 @@ class Main : XposedModule() {
                             is ByteArray -> String(a, Charsets.UTF_8)
                             else -> null
                         }
+                        // v5.3.1: 每次调用都打日志（path 末段 + 密码长度），诊断不再靠猜
+                        val pathTail = ((chain.getArg(0) as? String) ?: "").substringAfterLast('/')
+                        log("openDB path=$pathTail pwLen=${pw?.length ?: 0}")
                         if (!pw.isNullOrEmpty() && pw != cachedDbKey) {
                             cachedDbKey = pw
                             saveAndShareKey(pw)
                             log("DBKey captured from ${sqlCls.name}.${m.name}(), length=${pw.length}")
-                            // v5.3: DB 打开即触发导出（不依赖 Activity hook — 6.7.19 上该 hook 不触发）
+                        }
+                        // 捕获或已有 key → 单飞导出（失败允许重试：RUNNING 复位后再次触发）
+                        val k = pw ?: cachedDbKey
+                        if (!k.isNullOrEmpty()) {
                             currentApp()?.let { app ->
-                                if (!exportScheduled) {
-                                    exportScheduled = true
-                                    triggerExport(app, cl, pw)
+                                savedCtx.compareAndSet(null, app)
+                                if (!exportScheduled.getAndSet(true)) {
+                                    Thread {
+                                        val ok = runExport(app, cl, k)
+                                        if (!ok) exportScheduled.set(false)   // 失败重试
+                                    }.start()
                                 }
                             } ?: log("no app ctx yet for export")
                         }
@@ -156,6 +208,35 @@ class Main : XposedModule() {
             log("sqlcipher hook setup fail: $t")
         }
 
+        // ── 2.5 Application.onCreate watchdog：app 就绪后轮询 key（缓存/落盘文件），有 key 即单飞导出。
+        // 覆盖「DB 延迟打开」和「Activity hook 不触发」两种场景；失败 60s 后重试一次。
+        try {
+            val appCls = Class.forName("android.app.Application", false, cl)
+            val appOnCreate = appCls.getDeclaredMethod("onCreate")
+            hook(appOnCreate).intercept { chain ->
+                val result = chain.proceed()
+                val app = chain.getThisObject() as? android.app.Application ?: return@intercept result
+                if (app.packageName != "com.heytap.health") return@intercept result
+                Thread {
+                    for (i in 0 until 60) {   // 2s x 60 = 120s
+                        val k = cachedDbKey ?: readPersistedKey()
+                        if (!k.isNullOrEmpty() && exportScheduled.compareAndSet(false, true)) {
+                            savedCtx.compareAndSet(null, app)
+                            log("watchdog export attempt (key len=${k.length})")
+                            val ok = runExport(app, cl, k)
+                            if (!ok) { exportScheduled.set(false); Thread.sleep(60_000) }
+                        }
+                        try { Thread.sleep(2000) } catch (_: InterruptedException) { return@Thread }
+                    }
+                    log("watchdog timeout: no db_key in 120s")
+                }.start()
+                result
+            }
+            log("application watchdog armed")
+        } catch (t: Throwable) {
+            log("application hook fail: $t")
+        }
+
         // ── 3. Activity.onCreate → 自动导出（不再调用 bj4）──
         try {
             val activityCls = Class.forName("android.app.Activity", false, cl)
@@ -165,33 +246,8 @@ class Main : XposedModule() {
                 val result = chain.proceed()
                 val act = chain.getThisObject()
                 if (act is android.app.Activity) {
-                    if (exportScheduled) return@intercept result
-                    exportScheduled = true
-                    val appCtx = act.applicationContext
-                    savedCtx.set(appCtx)
-                    log("Activity created, scheduling auto-export (once)")
-                    Thread {
-                        try {
-                            // 轮询等待 db_key 就绪（最长 30s，每 2s 一次）
-                            var key: String? = null
-                            for (i in 0 until 15) {
-                                key = cachedDbKey ?: run {
-                                    val f = File("/data/local/tmp/dbkey_result.txt")
-                                    if (f.exists()) try { f.readText().trim().ifEmpty { null } } catch (_: Throwable) { null } else null
-                                }
-                                if (key != null) break
-                                Thread.sleep(2000)
-                            }
-                            if (key == null) {
-                                log("auto-export skipped: db_key not ready in 30s")
-                                return@Thread
-                            }
-                            log("auto-export start, key length=${key.length}")
-                            triggerExport(appCtx, cl, key)
-                        } catch (t: Throwable) {
-                            log("auto-export thread crash: ${t.javaClass.name}: ${t.message}")
-                        }
-                    }.start()
+                    savedCtx.compareAndSet(null, act.applicationContext)
+                    log("Activity created: ${act.javaClass.simpleName}")
                 }
                 result
             }
@@ -220,30 +276,31 @@ class Main : XposedModule() {
     }
 
     private fun triggerExport(appCtx: android.content.Context, cl: ClassLoader, key: String) {
-        try {
-            Thread {
+        Thread { runExport(appCtx, cl, key) }.start()
+    }
+
+    /** 同步导出（供重试路径复用）；返回 ExportWorker 结果 */
+    private fun runExport(appCtx: android.content.Context, cl: ClassLoader, key: String): Boolean {
+        return try {
+            log("triggering export...")
+            val toast: (String) -> Unit = { msg ->
                 try {
-                    log("triggering export...")
-                    val toast: (String) -> Unit = { msg ->
-                        try {
-                            android.os.Handler(android.os.Looper.getMainLooper()).post {
-                                android.widget.Toast.makeText(appCtx, msg, android.widget.Toast.LENGTH_LONG).show()
-                            }
-                        } catch (t: Throwable) {
-                            log("toast fail: $t")
-                        }
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        android.widget.Toast.makeText(appCtx, msg, android.widget.Toast.LENGTH_LONG).show()
                     }
-                    val ok = ExportWorker(appCtx, cl, key, lspLog = { msg -> log(msg) }, toast = toast).run()
-                    log("export done: $ok")
                 } catch (t: Throwable) {
-                    log("export thread crash: ${t.javaClass.name}: ${t.message}")
-                    val sw = java.io.StringWriter()
-                    t.printStackTrace(java.io.PrintWriter(sw))
-                    log("export stack: " + sw.toString().substring(0, Math.min(400, sw.toString().length)))
+                    log("toast fail: $t")
                 }
-            }.start()
+            }
+            val ok = ExportWorker(appCtx, cl, key, lspLog = { msg -> log(msg) }, toast = toast).run()
+            log("export done: $ok")
+            ok
         } catch (t: Throwable) {
-            log("export trigger fail: $t")
+            log("export crash: ${t.javaClass.name}: ${t.message}")
+            val sw = java.io.StringWriter()
+            t.printStackTrace(java.io.PrintWriter(sw))
+            log("export stack: " + sw.toString().substring(0, Math.min(400, sw.toString().length)))
+            false
         }
     }
 
@@ -257,6 +314,14 @@ class Main : XposedModule() {
         } catch (e: Throwable) {
             log("save fail: $e")
         }
+    }
+
+    /** 读已持久化的 key（v5.3.1 watchdog 用）；app UID 读自己写的 644 文件没问题 */
+    private fun readPersistedKey(): String? {
+        return try {
+            val f = File("/data/local/tmp/dbkey_result.txt")
+            if (f.exists()) f.readText().trim().ifEmpty { null } else null
+        } catch (_: Throwable) { null }
     }
 
     /**
