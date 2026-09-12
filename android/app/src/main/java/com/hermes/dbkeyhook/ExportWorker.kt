@@ -53,9 +53,10 @@ class ExportWorker(
     }
 
     private fun doExport(): Boolean {
-        // ponytail: 子进程(SportDaemonService等)的 classloader namespace 加载不了 libsqlcipher.so，只留主进程导出
-        if (android.os.Process.myProcessName().contains(":")) {
-            lspLog("skip export in child process: ${android.os.Process.myProcessName()}")
+        // ponytail: 只有 :SportDaemonService 子进程能加载 libsqlcipher.so（主进程 clns-11 namespace 拒绝），其余子进程跳过
+        val pname = android.os.Process.myProcessName()
+        if (pname.contains(":") && !pname.endsWith(":SportDaemonService")) {
+            lspLog("skip export in child process: $pname")
             return false
         }
         val prefs = readConfigViaRoot()
@@ -69,7 +70,18 @@ class ExportWorker(
         lspLog("server watermark: ${cursor.size} tables")
 
         val sqliteCls = openSqLite() ?: run { toast("❌ SQLCipher 加载失败"); return false }
-        val db = openDatabase(sqliteCls, dbPath, dbKey)
+        // ponytail: 宿主 native 未就绪时 invoke 抛 UnsatisfiedLinkError，等 5s 重试（最多 6 次=30s；宿主打开库前必先加载 libsqlcipher）
+        var db: Any? = null
+        for (attempt in 1..6) {
+            try { db = openDatabase(sqliteCls, dbPath, dbKey); break }
+            catch (t: Throwable) {
+                val cause = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t
+                lspLog("openDatabase attempt#$attempt failed: ${cause.javaClass.simpleName}")
+                if (attempt == 6) { lspLog("openDatabase give up"); return false }
+                Thread.sleep(5000)
+            }
+        }
+        if (db == null) return false
         val tables = listTables(db)
         lspLog("total tables: ${tables.size}, chunk=$CHUNK_ROWS 行/次上传")
 
@@ -238,11 +250,12 @@ class ExportWorker(
 
     private fun openSqLite(): Class<*>? {
         val candidates = listOf(
-            "net.sqlcipher.database.SQLiteDatabase",
             "net.zetetic.database.sqlcipher.SQLiteDatabase",
+            "net.sqlcipher.database.SQLiteDatabase",
         )
-        val loaders = mutableListOf<ClassLoader>(cl, ctx.classLoader)
-        try { System.loadLibrary("sqlcipher"); lspLog("libsqlcipher loaded") } catch (e: Throwable) {}
+        // ponytail: 模块自身 loadLibrary 永远失败（模块 lib 目录无该 so、hidden API 拦反射）。
+        // 改为验证宿主侧 native 就绪：宿主能反射到 zetetic 类即说明其已随宿主打开过 SQLCipher 库（openDatabase hook 抓 key 的前提），直接用宿主 cl。
+        val loaders = mutableListOf<ClassLoader>(ctx.classLoader, cl)
         for (cn in candidates) { try { loaders.add(Class.forName(cn).classLoader) } catch (e: Throwable) {} }
         for (cn in candidates) for (l in loaders) { try { return Class.forName(cn, false, l) } catch (e: Throwable) {} }
         return null
