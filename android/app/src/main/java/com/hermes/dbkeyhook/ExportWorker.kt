@@ -53,6 +53,11 @@ class ExportWorker(
     }
 
     private fun doExport(): Boolean {
+        // ponytail: 子进程(SportDaemonService等)的 classloader namespace 加载不了 libsqlcipher.so，只留主进程导出
+        if (android.os.Process.myProcessName().contains(":")) {
+            lspLog("skip export in child process: ${android.os.Process.myProcessName()}")
+            return false
+        }
         val prefs = readConfigViaRoot()
         val url = prefs.url
         val urlExternal = prefs.urlExternal
