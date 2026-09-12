@@ -154,8 +154,12 @@ class Main : XposedModule() {
                         // v5.3.1: 每次调用都打日志（path 末段 + 密码长度），诊断不再靠猜
                         val pathTail = ((chain.getArg(0) as? String) ?: "").substringAfterLast('/')
                         log("openDB path=$pathTail pwLen=${pw?.length ?: 0}")
+                        // v5.3.8: openDatabase 抓到的密码就是实际加密密码（无论 alias），落盘供 UI/导出用
+                        // 旧行为 pw != cachedDbKey 才落盘 → 6.7.19 上 hw_key 已在 DECRYPTED 缓存，跳过 → dbkey_result.txt 永不存在 → UI 永远未获取
                         if (!pw.isNullOrEmpty() && pw != cachedDbKey) {
                             cachedDbKey = pw
+                        }
+                        if (!pw.isNullOrEmpty()) {
                             saveAndShareKey(pw)
                             log("DBKey captured from ${sqlCls.name}.${m.name}(), length=${pw.length}")
                         }
@@ -339,7 +343,14 @@ class Main : XposedModule() {
             } catch (_: Throwable) {}
             log("db_key saved+shared (len=${key.length})")
         } catch (e: Throwable) {
-            log("saveAndShareKey fail: $e")
+            // v5.3.8: /data/local/tmp 目录属主 shell，健康 App UID 无权创建文件 → 兜底写私有 cacheDir（UI 用 su 读）
+            try {
+                val f2 = File(currentApp()?.cacheDir ?: java.io.File("/data/local/tmp"), "dbkey_result.txt")
+                f2.writeText(key)
+                log("db_key saved to cacheDir (len=${key.length})")
+            } catch (e2: Throwable) {
+                log("saveAndShareKey fail: $e / $e2")
+            }
         }
     }
 

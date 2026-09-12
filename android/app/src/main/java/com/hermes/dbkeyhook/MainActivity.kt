@@ -41,19 +41,26 @@ class MainActivity : ComponentActivity() {
                         Toast.makeText(this, "配置已保存", Toast.LENGTH_SHORT).show()
                     },
                     onManualExport = {
-                        // 前台打开健康 App → onCreate hook 自动轮询 db_key 并导出
-                        try {
-                            val intent = packageManager.getLaunchIntentForPackage("com.heytap.health")
-                            if (intent != null) {
-                                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                startActivity(intent)
-                                Toast.makeText(this, "已打开健康 App，等待 key 就绪后自动导出…", Toast.LENGTH_LONG).show()
-                            } else {
-                                Toast.makeText(this, "未找到健康 App", Toast.LENGTH_SHORT).show()
+                        // v5.3.8: 先 su 强杀健康 App 再拉起——6.7.19 主进程懒加载+保活，App 活着时 Activity/openDatabase hook 都不会再触发
+                        Thread {
+                            try {
+                                Runtime.getRuntime().exec(arrayOf("/system/bin/su", "-c",
+                                    "am force-stop com.heytap.health")).waitFor()
+                                Thread.sleep(1500)
+                            } catch (_: Throwable) {}
+                            try {
+                                val intent = packageManager.getLaunchIntentForPackage("com.heytap.health")
+                                if (intent != null) {
+                                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    startActivity(intent)
+                                    runOnUiThread { Toast.makeText(this, "已强杀并重启健康 App，等 key 就绪后自动导出…", Toast.LENGTH_LONG).show() }
+                                } else {
+                                    runOnUiThread { Toast.makeText(this, "未找到健康 App", Toast.LENGTH_SHORT).show() }
+                                }
+                            } catch (t: Throwable) {
+                                runOnUiThread { Toast.makeText(this, "打开失败: ${t.message}", Toast.LENGTH_SHORT).show() }
                             }
-                        } catch (t: Throwable) {
-                            Toast.makeText(this, "打开失败: ${t.message}", Toast.LENGTH_SHORT).show()
-                        }
+                        }.start()
                     }
                 )
             }
@@ -201,8 +208,17 @@ fun HealthConfigScreen(
 }
 
 private fun readLastKey(): String? {
-    return try {
+    // 1) 直读 /data/local/tmp（模块若 root 写入成功）
+    try {
         val f = File("/data/local/tmp/dbkey_result.txt")
-        if (f.exists()) f.readText().trim().ifEmpty { null } else null
+        if (f.exists()) f.readText().trim().ifEmpty { null }?.let { return it }
+    } catch (_: Throwable) {}
+    // 2) su 读健康 App 私有 cacheDir（v5.3.8: 健康App UID 无权写 /data/local/tmp，key 落在那里）
+    return try {
+        val p = Runtime.getRuntime().exec(arrayOf("/system/bin/su", "-c",
+            "cat /data/data/com.heytap.health/cache/dbkey_result.txt"))
+        val out = p.inputStream.bufferedReader().readText().trim()
+        p.waitFor()
+        out.ifEmpty { null }
     } catch (_: Throwable) { null }
 }
